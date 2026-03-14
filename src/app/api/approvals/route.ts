@@ -147,7 +147,7 @@ export async function POST(request: Request) {
       // Parse the actual error from arr API
       let friendlyError = errMsg;
       if (errMsg.includes("Arr API error")) {
-        const match = errMsg.match(/Arr API error (\d+): (.*)/s);
+        const match = errMsg.match(/Arr API error (\d+): ([\s\S]*)/);
         if (match) {
           const statusCode = match[1];
           try {
