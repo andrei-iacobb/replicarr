@@ -1,0 +1,27 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model ApprovedItem {
+  id               Int      @id @default(autoincrement())
+  type             String   // "movie" or "series"
+  title            String
+  year             Int?
+  tmdbId           Int
+  tvdbId           Int?
+  imdbId           String?
+  qualityProfileId Int
+  mainArrId        Int      // ID in main sonarr/radarr
+  lowqArrId        Int?     // ID in lowq instance once added
+  status           String   @default("pending") // pending, added, downloading, completed, failed
+  poster           String?
+  approvedAt       DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([type, tmdbId])
+}
