@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
 interface LibraryItem {
   id: number;
@@ -22,6 +22,19 @@ interface QualityProfile {
   name: string;
 }
 
+interface InstanceInfo {
+  name: string;
+  online: boolean;
+  version: string | null;
+  url: string;
+  seriesCount?: number;
+  movieCount?: number;
+  rootFolders?: { path: string; freeSpace: number }[];
+  diskSpace?: { path: string; freeSpace: number; totalSpace: number }[];
+  profileCount?: number;
+  queueCount?: number;
+}
+
 interface StatusData {
   stats: {
     total: number;
@@ -31,6 +44,12 @@ interface StatusData {
     completed: number;
     failed: number;
   };
+  instances: {
+    sonarrMain: InstanceInfo;
+    radarrMain: InstanceInfo;
+    sonarrLowq: InstanceInfo;
+    radarrLowq: InstanceInfo;
+  };
   qualityProfiles: {
     sonarr: QualityProfile[];
     radarr: QualityProfile[];
@@ -38,14 +57,27 @@ interface StatusData {
   queue: Array<{
     title?: string;
     status?: string;
+    trackedDownloadStatus?: string;
+    trackedDownloadState?: string;
     sizeleft?: number;
     size?: number;
+    timeleft?: string;
+    estimatedCompletionTime?: string;
     instance: string;
+    quality?: { quality?: { name?: string } };
   }>;
+}
+
+interface Toast {
+  id: number;
+  message: string;
+  type: "error" | "success";
 }
 
 type Tab = "library" | "approved" | "status";
 type Filter = "all" | "series" | "movie";
+
+let toastId = 0;
 
 export default function Home() {
   const [tab, setTab] = useState<Tab>("library");
@@ -55,9 +87,17 @@ export default function Home() {
   const [status, setStatus] = useState<StatusData | null>(null);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [profiles, setProfiles] = useState<QualityProfile[]>([]);
+  const [profiles, setProfiles] = useState<{ sonarr: QualityProfile[]; radarr: QualityProfile[] }>({ sonarr: [], radarr: [] });
   const [selectedProfile, setSelectedProfile] = useState<number>(0);
   const [approving, setApproving] = useState<Set<string>>(new Set());
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const profilesLoaded = useRef(false);
+
+  const addToast = (message: string, type: "error" | "success" = "error") => {
+    const id = ++toastId;
+    setToasts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 6000);
+  };
 
   const fetchLibrary = useCallback(async () => {
     setLoading(true);
@@ -65,8 +105,9 @@ export default function Home() {
       const res = await fetch(`/api/library?type=${filter}&search=${encodeURIComponent(search)}`);
       const data = await res.json();
       if (Array.isArray(data)) setLibrary(data);
+      else if (data.error) addToast(data.error);
     } catch (e) {
-      console.error(e);
+      addToast(`Failed to fetch library: ${e}`);
     }
     setLoading(false);
   }, [filter, search]);
@@ -74,31 +115,60 @@ export default function Home() {
   const fetchStatus = useCallback(async () => {
     try {
       const res = await fetch("/api/status");
-      setStatus(await res.json());
+      const data = await res.json();
+      if (data.error) addToast(data.error);
+      else setStatus(data);
     } catch (e) {
-      console.error(e);
+      addToast(`Failed to fetch status: ${e}`);
     }
   }, []);
 
-  useEffect(() => {
-    if (tab === "library") fetchLibrary();
-    if (tab === "status") fetchStatus();
-  }, [tab, fetchLibrary, fetchStatus]);
-
-  const fetchProfiles = async (type: string) => {
+  const fetchProfiles = useCallback(async () => {
+    if (profilesLoaded.current) return;
     try {
-      const res = await fetch(`/api/profiles?type=${type}`);
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        setProfiles(data);
-        if (data.length > 0) setSelectedProfile(data[0].id);
-      }
+      const [sonarrRes, radarrRes] = await Promise.all([
+        fetch("/api/profiles?type=series"),
+        fetch("/api/profiles?type=movie"),
+      ]);
+      const sonarr = await sonarrRes.json();
+      const radarr = await radarrRes.json();
+      const p = {
+        sonarr: Array.isArray(sonarr) ? sonarr : [],
+        radarr: Array.isArray(radarr) ? radarr : [],
+      };
+      setProfiles(p);
+      profilesLoaded.current = true;
+      // Auto-select first profile
+      const first = p.radarr[0] || p.sonarr[0];
+      if (first && selectedProfile === 0) setSelectedProfile(first.id);
     } catch (e) {
-      console.error(e);
+      addToast(`Failed to load quality profiles: ${e}`);
     }
-  };
+  }, [selectedProfile]);
+
+  useEffect(() => {
+    if (tab === "library") {
+      fetchLibrary();
+      fetchProfiles();
+    }
+    if (tab === "status") fetchStatus();
+  }, [tab, fetchLibrary, fetchStatus, fetchProfiles]);
+
+  // Auto-refresh status every 15s
+  useEffect(() => {
+    if (tab !== "status") return;
+    const interval = setInterval(fetchStatus, 15000);
+    return () => clearInterval(interval);
+  }, [tab, fetchStatus]);
+
+  const currentProfiles = filter === "series" ? profiles.sonarr : profiles.radarr;
 
   const approveItem = async (item: LibraryItem) => {
+    if (!selectedProfile || selectedProfile === 0) {
+      addToast("Select a quality profile before approving. Use the dropdown above the library.");
+      return;
+    }
+
     const key = `${item.type}:${item.tmdbId}`;
     setApproving((prev) => new Set(prev).add(key));
     try {
@@ -117,17 +187,21 @@ export default function Home() {
           poster: item.poster,
         }),
       });
+      const data = await res.json();
       if (res.ok) {
         setLibrary((prev) =>
           prev.map((i) =>
             i.type === item.type && i.tmdbId === item.tmdbId
-              ? { ...i, approved: true, status: "added" }
+              ? { ...i, approved: true, status: data.status || "added" }
               : i
           )
         );
+        addToast(`"${item.title}" approved and added to ${item.type === "series" ? "Sonarr" : "Radarr"}-LowQ`, "success");
+      } else {
+        addToast(data.error || `Failed to approve "${item.title}"`);
       }
     } catch (e) {
-      console.error(e);
+      addToast(`Network error approving "${item.title}": ${e}`);
     }
     setApproving((prev) => {
       const next = new Set(prev);
@@ -137,6 +211,10 @@ export default function Home() {
   };
 
   const bulkApprove = async () => {
+    if (!selectedProfile || selectedProfile === 0) {
+      addToast("Select a quality profile before approving. Use the dropdown above the library.");
+      return;
+    }
     const items = library.filter((i) => selected.has(`${i.type}:${i.tmdbId}`) && !i.approved);
     for (const item of items) {
       await approveItem(item);
@@ -163,8 +241,27 @@ export default function Home() {
     }
   };
 
+  const profileValid = selectedProfile > 0;
+
   return (
     <div className="max-w-7xl mx-auto px-4 py-6">
+      {/* Toasts */}
+      <div className="fixed top-4 right-4 z-50 flex flex-col gap-2 max-w-md">
+        {toasts.map((t) => (
+          <div
+            key={t.id}
+            className={`px-4 py-3 rounded-lg text-sm shadow-lg border animate-[slideIn_0.2s_ease-out] ${
+              t.type === "error"
+                ? "bg-red-900/90 border-red-700 text-red-100"
+                : "bg-green-900/90 border-green-700 text-green-100"
+            }`}
+            onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
+          >
+            {t.message}
+          </div>
+        ))}
+      </div>
+
       {/* Header */}
       <div className="flex items-center justify-between mb-8">
         <div>
@@ -236,23 +333,34 @@ export default function Home() {
 
           {/* Quality profile selector + bulk actions */}
           <div className="flex flex-wrap gap-3 mb-4 items-center">
-            <select
-              value={selectedProfile}
-              onChange={(e) => setSelectedProfile(Number(e.target.value))}
-              onFocus={() => {
-                if (profiles.length === 0) fetchProfiles(filter === "series" ? "series" : "movie");
-              }}
-              className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[var(--accent)]"
-            >
-              {profiles.length === 0 && <option>Click to load profiles...</option>}
-              {profiles.map((p) => (
-                <option key={p.id} value={p.id}>{p.name}</option>
-              ))}
-            </select>
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-[var(--text-secondary)]">Quality:</label>
+              <select
+                value={selectedProfile}
+                onChange={(e) => setSelectedProfile(Number(e.target.value))}
+                className={`bg-[var(--bg-card)] border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[var(--accent)] ${
+                  profileValid ? "border-[var(--border)]" : "border-red-500 text-red-400"
+                }`}
+              >
+                <option value={0}>-- Select profile --</option>
+                {currentProfiles.map((p) => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+                {currentProfiles.length === 0 && profiles.radarr.length > 0 && (
+                  profiles.radarr.map((p) => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))
+                )}
+              </select>
+              {!profileValid && (
+                <span className="text-xs text-red-400">Required</span>
+              )}
+            </div>
             {selected.size > 0 && (
               <button
                 onClick={bulkApprove}
-                className="px-4 py-2 text-sm bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded-lg font-medium"
+                disabled={!profileValid}
+                className="px-4 py-2 text-sm bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded-lg font-medium disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 Approve {selected.size} selected
               </button>
@@ -265,6 +373,9 @@ export default function Home() {
                 ? "Deselect all"
                 : "Select all unapproved"}
             </button>
+            <span className="text-xs text-[var(--text-secondary)] ml-auto">
+              {library.length} items &middot; {library.filter((i) => i.approved).length} approved
+            </span>
           </div>
 
           {loading ? (
@@ -300,7 +411,6 @@ export default function Home() {
                           {item.title}
                         </div>
                       )}
-                      {/* Badge overlay */}
                       <div className="absolute top-1 left-1 flex gap-1">
                         <span className={`px-1.5 py-0.5 text-[10px] font-medium rounded ${
                           item.type === "series" ? "bg-blue-500/80" : "bg-purple-500/80"
@@ -317,7 +427,6 @@ export default function Home() {
                           </span>
                         </div>
                       )}
-                      {/* Hover approve button */}
                       {!item.approved && (
                         <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
                           <button
@@ -325,10 +434,11 @@ export default function Home() {
                               e.stopPropagation();
                               approveItem(item);
                             }}
-                            disabled={isApproving}
+                            disabled={isApproving || !profileValid}
                             className="px-3 py-1.5 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-sm rounded-lg font-medium disabled:opacity-50"
+                            title={!profileValid ? "Select a quality profile first" : ""}
                           >
-                            {isApproving ? "Adding..." : "Approve"}
+                            {isApproving ? "Adding..." : !profileValid ? "No profile" : "Approve"}
                           </button>
                         </div>
                       )}
@@ -353,57 +463,34 @@ export default function Home() {
       )}
 
       {/* Approved Tab */}
-      {tab === "approved" && <ApprovedTab />}
+      {tab === "approved" && <ApprovedTab onToast={addToast} />}
 
       {/* Status Tab */}
-      {tab === "status" && status && (
-        <div>
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
-            <StatCard label="Total Approved" value={status.stats.total} />
-            <StatCard label="Pending" value={status.stats.pending} color="var(--warning)" />
-            <StatCard label="Added" value={status.stats.added} color="var(--accent)" />
-            <StatCard label="Downloading" value={status.stats.downloading} color="var(--warning)" />
-            <StatCard label="Failed" value={status.stats.failed} color="var(--danger)" />
-          </div>
-          {status.queue.length > 0 && (
-            <div>
-              <h3 className="text-lg font-medium mb-3">Download Queue</h3>
-              <div className="space-y-2">
-                {status.queue.map((q, i) => (
-                  <div key={i} className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-3 flex justify-between items-center">
-                    <div>
-                      <p className="text-sm font-medium">{q.title || "Unknown"}</p>
-                      <p className="text-xs text-[var(--text-secondary)]">{q.instance} &middot; {q.status}</p>
-                    </div>
-                    {q.size && q.sizeleft && (
-                      <div className="text-right">
-                        <p className="text-sm">{Math.round(((q.size - q.sizeleft) / q.size) * 100)}%</p>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
+      {tab === "status" && <StatusTab status={status} onRefresh={fetchStatus} />}
     </div>
   );
 }
 
-function ApprovedTab() {
+function ApprovedTab({ onToast }: { onToast: (msg: string, type?: "error" | "success") => void }) {
   const [items, setItems] = useState<Array<{
     id: number;
     type: string;
     title: string;
     year: number | null;
+    tmdbId: number;
+    tvdbId?: number;
+    imdbId?: string;
+    mainArrId: number;
     poster: string | null;
     status: string;
+    qualityProfileId: number;
     approvedAt: string;
+    updatedAt: string;
   }>>([]);
   const [loading, setLoading] = useState(true);
+  const [retrying, setRetrying] = useState<Set<number>>(new Set());
 
-  useEffect(() => {
+  const fetchItems = useCallback(() => {
     fetch("/api/approvals")
       .then((r) => r.json())
       .then((data) => {
@@ -413,9 +500,47 @@ function ApprovedTab() {
       .catch(() => setLoading(false));
   }, []);
 
-  const removeItem = async (id: number) => {
+  useEffect(() => { fetchItems(); }, [fetchItems]);
+
+  const removeItem = async (id: number, title: string) => {
     await fetch(`/api/approvals?id=${id}`, { method: "DELETE" });
     setItems((prev) => prev.filter((i) => i.id !== id));
+    onToast(`"${title}" removed`, "success");
+  };
+
+  const retryItem = async (item: typeof items[0]) => {
+    setRetrying((prev) => new Set(prev).add(item.id));
+    try {
+      const res = await fetch("/api/approvals", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: item.type,
+          tmdbId: item.tmdbId,
+          tvdbId: item.tvdbId,
+          imdbId: item.imdbId,
+          title: item.title,
+          year: item.year,
+          qualityProfileId: item.qualityProfileId,
+          mainArrId: item.mainArrId,
+          poster: item.poster,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        onToast(`"${item.title}" retried successfully`, "success");
+        fetchItems();
+      } else {
+        onToast(data.error || `Failed to retry "${item.title}"`);
+      }
+    } catch (e) {
+      onToast(`Retry failed: ${e}`);
+    }
+    setRetrying((prev) => {
+      const next = new Set(prev);
+      next.delete(item.id);
+      return next;
+    });
   };
 
   if (loading) return <div className="text-center py-12 text-[var(--text-secondary)]">Loading...</div>;
@@ -431,7 +556,7 @@ function ApprovedTab() {
           className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-3 flex items-center gap-3"
         >
           {item.poster && (
-            <img src={item.poster} alt="" className="w-10 h-14 rounded object-cover" />
+            <img src={item.poster} alt="" className="w-10 h-14 rounded object-cover flex-shrink-0" />
           )}
           <div className="flex-1 min-w-0">
             <p className="text-sm font-medium truncate">{item.title}</p>
@@ -440,22 +565,185 @@ function ApprovedTab() {
               {new Date(item.approvedAt).toLocaleDateString()}
             </p>
           </div>
-          <span className={`px-2 py-1 text-xs rounded font-medium ${
+          <span className={`px-2 py-1 text-xs rounded font-medium flex-shrink-0 ${
             item.status === "added" ? "bg-green-500/20 text-green-400" :
             item.status === "failed" ? "bg-red-500/20 text-red-400" :
             item.status === "downloading" ? "bg-yellow-500/20 text-yellow-400" :
+            item.status === "completed" ? "bg-blue-500/20 text-blue-400" :
             "bg-gray-500/20 text-gray-400"
           }`}>
             {item.status}
           </span>
+          {item.status === "failed" && (
+            <button
+              onClick={() => retryItem(item)}
+              disabled={retrying.has(item.id)}
+              className="text-[var(--accent)] hover:text-[var(--accent-hover)] text-sm px-2 flex-shrink-0 disabled:opacity-50"
+            >
+              {retrying.has(item.id) ? "Retrying..." : "Retry"}
+            </button>
+          )}
           <button
-            onClick={() => removeItem(item.id)}
-            className="text-[var(--text-secondary)] hover:text-[var(--danger)] text-sm px-2"
+            onClick={() => removeItem(item.id, item.title)}
+            className="text-[var(--text-secondary)] hover:text-[var(--danger)] text-sm px-2 flex-shrink-0"
           >
             Remove
           </button>
         </div>
       ))}
+    </div>
+  );
+}
+
+function StatusTab({ status, onRefresh }: { status: StatusData | null; onRefresh: () => void }) {
+  if (!status) return <div className="text-center py-12 text-[var(--text-secondary)]">Loading status...</div>;
+
+  const instances = Object.values(status.instances);
+
+  return (
+    <div className="space-y-6">
+      {/* Stats */}
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+        <StatCard label="Total Approved" value={status.stats.total} />
+        <StatCard label="Pending" value={status.stats.pending} color="var(--warning)" />
+        <StatCard label="Added" value={status.stats.added} color="var(--accent)" />
+        <StatCard label="Downloading" value={status.stats.downloading} color="var(--warning)" />
+        <StatCard label="Failed" value={status.stats.failed} color="var(--danger)" />
+      </div>
+
+      {/* Instance Health */}
+      <div>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-lg font-medium">Instances</h3>
+          <button onClick={onRefresh} className="text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)]">
+            Refresh
+          </button>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {instances.map((inst) => (
+            <div key={inst.name} className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-4">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <div className={`w-2 h-2 rounded-full ${inst.online ? "bg-green-500" : "bg-red-500"}`} />
+                  <span className="text-sm font-medium">{inst.name}</span>
+                </div>
+                <span className="text-xs text-[var(--text-secondary)]">
+                  {inst.online ? `v${inst.version}` : "Offline"}
+                </span>
+              </div>
+              <div className="text-xs text-[var(--text-secondary)] space-y-1">
+                <p className="truncate">URL: {inst.url}</p>
+                {"seriesCount" in inst && inst.seriesCount !== undefined && (
+                  <p>Series: {inst.seriesCount} &middot; Profiles: {inst.profileCount} &middot; Queue: {inst.queueCount}</p>
+                )}
+                {"movieCount" in inst && inst.movieCount !== undefined && (
+                  <p>Movies: {inst.movieCount} &middot; Profiles: {inst.profileCount} &middot; Queue: {inst.queueCount}</p>
+                )}
+                {inst.rootFolders && inst.rootFolders.length > 0 && (
+                  <div>
+                    {inst.rootFolders.map((rf, i) => (
+                      <p key={i}>Root: {rf.path} ({formatBytes(rf.freeSpace)} free)</p>
+                    ))}
+                  </div>
+                )}
+                {inst.diskSpace && inst.diskSpace.length > 0 && (
+                  <div>
+                    {inst.diskSpace.map((d: { path: string; freeSpace: number; totalSpace: number }, i: number) => (
+                      <div key={i} className="mt-1">
+                        <div className="flex justify-between text-[10px]">
+                          <span>{d.path}</span>
+                          <span>{formatBytes(d.freeSpace)} / {formatBytes(d.totalSpace)}</span>
+                        </div>
+                        <div className="w-full h-1.5 bg-gray-700 rounded-full mt-0.5">
+                          <div
+                            className={`h-full rounded-full ${
+                              (d.totalSpace - d.freeSpace) / d.totalSpace > 0.9 ? "bg-red-500" : "bg-[var(--accent)]"
+                            }`}
+                            style={{ width: `${((d.totalSpace - d.freeSpace) / d.totalSpace) * 100}%` }}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Download Queue */}
+      <div>
+        <h3 className="text-lg font-medium mb-3">
+          Download Queue {status.queue.length > 0 && <span className="text-sm text-[var(--text-secondary)]">({status.queue.length})</span>}
+        </h3>
+        {status.queue.length === 0 ? (
+          <div className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-6 text-center text-sm text-[var(--text-secondary)]">
+            No active downloads
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {status.queue.map((q, i) => {
+              const progress = q.size && q.sizeleft ? Math.round(((q.size - q.sizeleft) / q.size) * 100) : 0;
+              return (
+                <div key={i} className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-3">
+                  <div className="flex justify-between items-center mb-1">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium truncate">{q.title || "Unknown"}</p>
+                      <p className="text-xs text-[var(--text-secondary)]">
+                        {q.instance} &middot; {q.quality?.quality?.name || "Unknown"} &middot; {q.status}
+                        {q.trackedDownloadState && ` (${q.trackedDownloadState})`}
+                        {q.timeleft && ` &middot; ETA: ${q.timeleft}`}
+                      </p>
+                    </div>
+                    <div className="text-right ml-4 flex-shrink-0">
+                      <p className="text-sm font-medium">{progress}%</p>
+                      {q.size && <p className="text-[10px] text-[var(--text-secondary)]">{formatBytes(q.size)}</p>}
+                    </div>
+                  </div>
+                  {q.size && q.sizeleft !== undefined && (
+                    <div className="w-full h-1.5 bg-gray-700 rounded-full">
+                      <div
+                        className="h-full bg-[var(--accent)] rounded-full transition-all"
+                        style={{ width: `${progress}%` }}
+                      />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Quality Profiles */}
+      <div>
+        <h3 className="text-lg font-medium mb-3">LowQ Quality Profiles</h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-4">
+            <p className="text-sm font-medium mb-2">Sonarr-LowQ</p>
+            <div className="flex flex-wrap gap-1">
+              {status.qualityProfiles.sonarr.map((p) => (
+                <span key={p.id} className="px-2 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded">{p.name}</span>
+              ))}
+              {status.qualityProfiles.sonarr.length === 0 && (
+                <span className="text-xs text-[var(--text-secondary)]">No profiles configured</span>
+              )}
+            </div>
+          </div>
+          <div className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-4">
+            <p className="text-sm font-medium mb-2">Radarr-LowQ</p>
+            <div className="flex flex-wrap gap-1">
+              {status.qualityProfiles.radarr.map((p) => (
+                <span key={p.id} className="px-2 py-0.5 text-xs bg-purple-500/20 text-purple-400 rounded">{p.name}</span>
+              ))}
+              {status.qualityProfiles.radarr.length === 0 && (
+                <span className="text-xs text-[var(--text-secondary)]">No profiles configured</span>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -476,4 +764,12 @@ function StatCard({ label, value, color }: { label: string; value: number; color
       <p className="text-xs text-[var(--text-secondary)] mt-1">{label}</p>
     </div>
   );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
 }
