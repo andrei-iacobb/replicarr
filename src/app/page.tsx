@@ -489,6 +489,8 @@ function ApprovedTab({ onToast }: { onToast: (msg: string, type?: "error" | "suc
   }>>([]);
   const [loading, setLoading] = useState(true);
   const [retrying, setRetrying] = useState<Set<number>>(new Set());
+  const [profiles, setProfiles] = useState<{ sonarr: QualityProfile[]; radarr: QualityProfile[] }>({ sonarr: [], radarr: [] });
+  const [retryProfiles, setRetryProfiles] = useState<Record<number, number>>({});
 
   const fetchItems = useCallback(() => {
     fetch("/api/approvals")
@@ -500,7 +502,18 @@ function ApprovedTab({ onToast }: { onToast: (msg: string, type?: "error" | "suc
       .catch(() => setLoading(false));
   }, []);
 
-  useEffect(() => { fetchItems(); }, [fetchItems]);
+  useEffect(() => {
+    fetchItems();
+    Promise.all([
+      fetch("/api/profiles?type=series").then((r) => r.json()),
+      fetch("/api/profiles?type=movie").then((r) => r.json()),
+    ]).then(([sonarr, radarr]) => {
+      setProfiles({
+        sonarr: Array.isArray(sonarr) ? sonarr : [],
+        radarr: Array.isArray(radarr) ? radarr : [],
+      });
+    });
+  }, [fetchItems]);
 
   const removeItem = async (id: number, title: string) => {
     await fetch(`/api/approvals?id=${id}`, { method: "DELETE" });
@@ -509,6 +522,11 @@ function ApprovedTab({ onToast }: { onToast: (msg: string, type?: "error" | "suc
   };
 
   const retryItem = async (item: typeof items[0]) => {
+    const profileId = retryProfiles[item.id] || item.qualityProfileId;
+    if (!profileId || profileId === 0) {
+      onToast("Select a quality profile before retrying.");
+      return;
+    }
     setRetrying((prev) => new Set(prev).add(item.id));
     try {
       const res = await fetch("/api/approvals", {
@@ -521,7 +539,7 @@ function ApprovedTab({ onToast }: { onToast: (msg: string, type?: "error" | "suc
           imdbId: item.imdbId,
           title: item.title,
           year: item.year,
-          qualityProfileId: item.qualityProfileId,
+          qualityProfileId: profileId,
           mainArrId: item.mainArrId,
           poster: item.poster,
         }),
@@ -550,47 +568,64 @@ function ApprovedTab({ onToast }: { onToast: (msg: string, type?: "error" | "suc
       {items.length === 0 && (
         <div className="text-center py-12 text-[var(--text-secondary)]">No approved items yet.</div>
       )}
-      {items.map((item) => (
-        <div
-          key={item.id}
-          className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-3 flex items-center gap-3"
-        >
-          {item.poster && (
-            <img src={item.poster} alt="" className="w-10 h-14 rounded object-cover flex-shrink-0" />
-          )}
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium truncate">{item.title}</p>
-            <p className="text-xs text-[var(--text-secondary)]">
-              {item.type === "series" ? "TV" : "Film"} &middot; {item.year} &middot;{" "}
-              {new Date(item.approvedAt).toLocaleDateString()}
-            </p>
-          </div>
-          <span className={`px-2 py-1 text-xs rounded font-medium flex-shrink-0 ${
-            item.status === "added" ? "bg-green-500/20 text-green-400" :
-            item.status === "failed" ? "bg-red-500/20 text-red-400" :
-            item.status === "downloading" ? "bg-yellow-500/20 text-yellow-400" :
-            item.status === "completed" ? "bg-blue-500/20 text-blue-400" :
-            "bg-gray-500/20 text-gray-400"
-          }`}>
-            {item.status}
-          </span>
-          {item.status === "failed" && (
-            <button
-              onClick={() => retryItem(item)}
-              disabled={retrying.has(item.id)}
-              className="text-[var(--accent)] hover:text-[var(--accent-hover)] text-sm px-2 flex-shrink-0 disabled:opacity-50"
-            >
-              {retrying.has(item.id) ? "Retrying..." : "Retry"}
-            </button>
-          )}
-          <button
-            onClick={() => removeItem(item.id, item.title)}
-            className="text-[var(--text-secondary)] hover:text-[var(--danger)] text-sm px-2 flex-shrink-0"
+      {items.map((item) => {
+        const itemProfiles = item.type === "series" ? profiles.sonarr : profiles.radarr;
+        const currentProfile = retryProfiles[item.id] || item.qualityProfileId;
+        const profileName = itemProfiles.find((p) => p.id === item.qualityProfileId)?.name;
+        return (
+          <div
+            key={item.id}
+            className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-3 flex items-center gap-3"
           >
-            Remove
-          </button>
-        </div>
-      ))}
+            {item.poster && (
+              <img src={item.poster} alt="" className="w-10 h-14 rounded object-cover flex-shrink-0" />
+            )}
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium truncate">{item.title}</p>
+              <p className="text-xs text-[var(--text-secondary)]">
+                {item.type === "series" ? "TV" : "Film"} &middot; {item.year} &middot;{" "}
+                {profileName && <>{profileName} &middot; </>}
+                {new Date(item.approvedAt).toLocaleDateString()}
+              </p>
+            </div>
+            <span className={`px-2 py-1 text-xs rounded font-medium flex-shrink-0 ${
+              item.status === "added" ? "bg-green-500/20 text-green-400" :
+              item.status === "failed" ? "bg-red-500/20 text-red-400" :
+              item.status === "downloading" ? "bg-yellow-500/20 text-yellow-400" :
+              item.status === "completed" ? "bg-blue-500/20 text-blue-400" :
+              "bg-gray-500/20 text-gray-400"
+            }`}>
+              {item.status}
+            </span>
+            {item.status === "failed" && (
+              <>
+                <select
+                  value={currentProfile}
+                  onChange={(e) => setRetryProfiles((prev) => ({ ...prev, [item.id]: Number(e.target.value) }))}
+                  className="bg-[var(--bg-card)] border border-[var(--border)] rounded px-2 py-1 text-xs focus:outline-none focus:border-[var(--accent)] flex-shrink-0"
+                >
+                  {itemProfiles.map((p) => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+                <button
+                  onClick={() => retryItem(item)}
+                  disabled={retrying.has(item.id)}
+                  className="text-[var(--accent)] hover:text-[var(--accent-hover)] text-sm px-2 flex-shrink-0 disabled:opacity-50"
+                >
+                  {retrying.has(item.id) ? "Retrying..." : "Retry"}
+                </button>
+              </>
+            )}
+            <button
+              onClick={() => removeItem(item.id, item.title)}
+              className="text-[var(--text-secondary)] hover:text-[var(--danger)] text-sm px-2 flex-shrink-0"
+            >
+              Remove
+            </button>
+          </div>
+        );
+      })}
     </div>
   );
 }
