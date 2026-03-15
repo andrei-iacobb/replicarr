@@ -35,6 +35,30 @@ interface InstanceInfo {
   queueCount?: number;
 }
 
+interface ContentMovie {
+  id: number;
+  title: string;
+  year: number;
+  hasFile: boolean;
+  monitored: boolean;
+  sizeOnDisk: number;
+  qualityName: string | null;
+  status: string;
+  poster: string | null;
+}
+
+interface ContentSeries {
+  id: number;
+  title: string;
+  year: number;
+  monitored: boolean;
+  episodeFileCount: number;
+  episodeCount: number;
+  sizeOnDisk: number;
+  status: string;
+  poster: string | null;
+}
+
 interface StatusData {
   stats: {
     total: number;
@@ -66,6 +90,10 @@ interface StatusData {
     instance: string;
     quality?: { quality?: { name?: string } };
   }>;
+  content: {
+    movies: ContentMovie[];
+    series: ContentSeries[];
+  };
 }
 
 interface Toast {
@@ -154,12 +182,10 @@ export default function Home() {
     if (tab === "status") fetchStatus();
   }, [tab, fetchLibrary, fetchStatus, fetchProfiles]);
 
-  // Auto-refresh status every 15s
+  // Fetch status on tab switch (live refresh is handled inside StatusTab)
   useEffect(() => {
-    if (tab !== "status") return;
-    const interval = setInterval(fetchStatus, 15000);
-    return () => clearInterval(interval);
-  }, [tab, fetchStatus]);
+    if (tab === "status" && !status) fetchStatus();
+  }, [tab, status, fetchStatus]);
 
   const currentProfiles = filter === "series" ? profiles.sonarr : profiles.radarr;
 
@@ -631,33 +657,187 @@ function ApprovedTab({ onToast }: { onToast: (msg: string, type?: "error" | "suc
 }
 
 function StatusTab({ status, onRefresh }: { status: StatusData | null; onRefresh: () => void }) {
+  const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
+  const [countdown, setCountdown] = useState(5);
+
+  // Live auto-refresh every 5s
+  useEffect(() => {
+    const interval = setInterval(() => {
+      onRefresh();
+      setLastUpdate(new Date());
+      setCountdown(5);
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [onRefresh]);
+
+  useEffect(() => {
+    const tick = setInterval(() => setCountdown((c) => Math.max(0, c - 1)), 1000);
+    return () => clearInterval(tick);
+  }, []);
+
   if (!status) return <div className="text-center py-12 text-[var(--text-secondary)]">Loading status...</div>;
 
-  const instances = Object.values(status.instances);
+  const allContent = [
+    ...status.content.movies.map((m) => ({ ...m, type: "movie" as const, detail: m.qualityName || (m.hasFile ? "Has file" : "No file") })),
+    ...status.content.series.map((s) => ({ ...s, type: "series" as const, detail: `${s.episodeFileCount}/${s.episodeCount} eps` })),
+  ];
+  const downloadingContent = allContent.filter((c) => c.status === "downloading");
+  const completedContent = allContent.filter((c) => c.status === "completed");
+  const missingContent = allContent.filter((c) => c.status === "missing" || c.status === "partial");
 
   return (
     <div className="space-y-6">
+      {/* Live indicator */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+          <span className="text-xs text-[var(--text-secondary)]">
+            Live &middot; updated {lastUpdate.toLocaleTimeString()} &middot; next in {countdown}s
+          </span>
+        </div>
+        <button onClick={() => { onRefresh(); setLastUpdate(new Date()); setCountdown(5); }} className="text-xs text-[var(--accent)] hover:text-[var(--accent-hover)]">
+          Refresh now
+        </button>
+      </div>
+
       {/* Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-        <StatCard label="Total Approved" value={status.stats.total} />
-        <StatCard label="Pending" value={status.stats.pending} color="var(--warning)" />
-        <StatCard label="Added" value={status.stats.added} color="var(--accent)" />
-        <StatCard label="Downloading" value={status.stats.downloading} color="var(--warning)" />
+      <div className="grid grid-cols-3 md:grid-cols-6 gap-3">
+        <StatCard label="Approved" value={status.stats.total} />
+        <StatCard label="In LowQ" value={allContent.length} color="var(--accent)" />
+        <StatCard label="Downloading" value={status.queue.length} color="var(--warning)" />
+        <StatCard label="Completed" value={completedContent.length} color="var(--success)" />
+        <StatCard label="Missing" value={missingContent.length} color="var(--text-secondary)" />
         <StatCard label="Failed" value={status.stats.failed} color="var(--danger)" />
       </div>
 
-      {/* Instance Health */}
+      {/* Active Downloads - prominent */}
       <div>
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="text-lg font-medium">Instances</h3>
-          <button onClick={onRefresh} className="text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)]">
-            Refresh
-          </button>
+        <h3 className="text-lg font-medium mb-3 flex items-center gap-2">
+          Active Downloads
+          {status.queue.length > 0 && (
+            <span className="px-2 py-0.5 text-xs bg-yellow-500/20 text-yellow-400 rounded-full">{status.queue.length}</span>
+          )}
+        </h3>
+        {status.queue.length === 0 ? (
+          <div className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-8 text-center">
+            <p className="text-[var(--text-secondary)]">No active downloads</p>
+            <p className="text-xs text-[var(--text-secondary)] mt-1">Approve items from the Library tab to start downloading</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {status.queue.map((q, i) => {
+              const progress = q.size && q.sizeleft !== undefined
+                ? Math.round(((q.size - q.sizeleft) / q.size) * 100)
+                : 0;
+              const downloaded = q.size && q.sizeleft !== undefined ? q.size - q.sizeleft : 0;
+              const isStalled = q.trackedDownloadStatus === "warning" || q.trackedDownloadState === "importBlocked";
+              const isCompleted = progress === 100 || q.trackedDownloadState === "importPending";
+              return (
+                <div key={i} className={`bg-[var(--bg-card)] border rounded-lg p-4 ${
+                  isStalled ? "border-yellow-500/40" : isCompleted ? "border-green-500/40" : "border-[var(--border)]"
+                }`}>
+                  <div className="flex justify-between items-start mb-2">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium truncate">{q.title || "Unknown"}</p>
+                      <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-1">
+                        <span className="text-xs text-[var(--text-secondary)]">{q.instance}</span>
+                        <span className="text-xs text-[var(--text-secondary)]">{q.quality?.quality?.name || "?"}</span>
+                        {q.status && (
+                          <span className={`text-xs ${isStalled ? "text-yellow-400" : isCompleted ? "text-green-400" : "text-[var(--text-secondary)]"}`}>
+                            {q.trackedDownloadState || q.status}
+                          </span>
+                        )}
+                        {q.timeleft && q.timeleft !== "00:00:00" && (
+                          <span className="text-xs text-[var(--accent)]">ETA: {q.timeleft}</span>
+                        )}
+                      </div>
+                    </div>
+                    <div className="text-right ml-4 flex-shrink-0">
+                      <p className={`text-lg font-bold ${isCompleted ? "text-green-400" : "text-[var(--text-primary)]"}`}>{progress}%</p>
+                      <p className="text-[10px] text-[var(--text-secondary)]">
+                        {formatBytes(downloaded)} / {q.size ? formatBytes(q.size) : "?"}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="w-full h-2 bg-gray-700 rounded-full overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all duration-1000 ${
+                        isStalled ? "bg-yellow-500" : isCompleted ? "bg-green-500" : "bg-[var(--accent)]"
+                      }`}
+                      style={{ width: `${progress}%` }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* LowQ Content - what's been added */}
+      {allContent.length > 0 && (
+        <div>
+          <h3 className="text-lg font-medium mb-3">LowQ Content ({allContent.length})</h3>
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2">
+            {allContent.map((item) => (
+              <div key={`${item.type}-${item.id}`} className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg overflow-hidden">
+                <div className="aspect-[2/3] relative">
+                  {item.poster ? (
+                    <img src={item.poster} alt={item.title} className="w-full h-full object-cover" loading="lazy" />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-[var(--text-secondary)] text-[10px] p-1 text-center bg-gray-800">
+                      {item.title}
+                    </div>
+                  )}
+                  <div className="absolute top-1 left-1">
+                    <span className={`px-1 py-0.5 text-[9px] font-medium rounded text-white ${
+                      item.type === "series" ? "bg-blue-500/80" : "bg-purple-500/80"
+                    }`}>
+                      {item.type === "series" ? "TV" : "Film"}
+                    </span>
+                  </div>
+                  <div className="absolute top-1 right-1">
+                    <span className={`px-1 py-0.5 text-[9px] font-medium rounded text-white ${
+                      item.status === "downloading" ? "bg-yellow-500/80" :
+                      item.status === "completed" ? "bg-green-500/80" :
+                      item.status === "partial" ? "bg-blue-500/80" :
+                      "bg-gray-500/80"
+                    }`}>
+                      {item.status}
+                    </span>
+                  </div>
+                  {item.status === "downloading" && (
+                    <div className="absolute bottom-0 left-0 right-0 h-1 bg-gray-700">
+                      <div className="h-full bg-yellow-500 animate-pulse" style={{ width: "50%" }} />
+                    </div>
+                  )}
+                </div>
+                <div className="p-1.5">
+                  <p className="text-[10px] font-medium truncate">{item.title}</p>
+                  <p className="text-[9px] text-[var(--text-secondary)]">
+                    {item.year} &middot; {item.detail}
+                    {item.sizeOnDisk > 0 && <> &middot; {formatBytes(item.sizeOnDisk)}</>}
+                  </p>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {instances.map((inst) => (
-            <div key={inst.name} className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-4">
-              <div className="flex items-center justify-between mb-3">
+      )}
+
+      {/* Instance Health - collapsed */}
+      <details className="group">
+        <summary className="text-lg font-medium mb-3 cursor-pointer list-none flex items-center gap-2">
+          <span className="text-xs text-[var(--text-secondary)] group-open:rotate-90 transition-transform">&#9654;</span>
+          Instances
+          <span className="text-xs text-[var(--text-secondary)]">
+            ({Object.values(status.instances).filter((i) => i.online).length}/{Object.values(status.instances).length} online)
+          </span>
+        </summary>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+          {Object.values(status.instances).map((inst) => (
+            <div key={inst.name} className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-3">
+              <div className="flex items-center justify-between mb-2">
                 <div className="flex items-center gap-2">
                   <div className={`w-2 h-2 rounded-full ${inst.online ? "bg-green-500" : "bg-red-500"}`} />
                   <span className="text-sm font-medium">{inst.name}</span>
@@ -666,119 +846,21 @@ function StatusTab({ status, onRefresh }: { status: StatusData | null; onRefresh
                   {inst.online ? `v${inst.version}` : "Offline"}
                 </span>
               </div>
-              <div className="text-xs text-[var(--text-secondary)] space-y-1">
-                <p className="truncate">URL: {inst.url}</p>
+              <div className="text-xs text-[var(--text-secondary)] space-y-0.5">
                 {"seriesCount" in inst && inst.seriesCount !== undefined && (
-                  <p>Series: {inst.seriesCount} &middot; Profiles: {inst.profileCount} &middot; Queue: {inst.queueCount}</p>
+                  <p>Series: {inst.seriesCount} &middot; Queue: {inst.queueCount}</p>
                 )}
                 {"movieCount" in inst && inst.movieCount !== undefined && (
-                  <p>Movies: {inst.movieCount} &middot; Profiles: {inst.profileCount} &middot; Queue: {inst.queueCount}</p>
+                  <p>Movies: {inst.movieCount} &middot; Queue: {inst.queueCount}</p>
                 )}
-                {inst.rootFolders && inst.rootFolders.length > 0 && (
-                  <div>
-                    {inst.rootFolders.map((rf, i) => (
-                      <p key={i}>Root: {rf.path} ({formatBytes(rf.freeSpace)} free)</p>
-                    ))}
-                  </div>
-                )}
-                {inst.diskSpace && inst.diskSpace.length > 0 && (
-                  <div>
-                    {inst.diskSpace.map((d: { path: string; freeSpace: number; totalSpace: number }, i: number) => (
-                      <div key={i} className="mt-1">
-                        <div className="flex justify-between text-[10px]">
-                          <span>{d.path}</span>
-                          <span>{formatBytes(d.freeSpace)} / {formatBytes(d.totalSpace)}</span>
-                        </div>
-                        <div className="w-full h-1.5 bg-gray-700 rounded-full mt-0.5">
-                          <div
-                            className={`h-full rounded-full ${
-                              (d.totalSpace - d.freeSpace) / d.totalSpace > 0.9 ? "bg-red-500" : "bg-[var(--accent)]"
-                            }`}
-                            style={{ width: `${((d.totalSpace - d.freeSpace) / d.totalSpace) * 100}%` }}
-                          />
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                {inst.rootFolders && inst.rootFolders.map((rf, i) => (
+                  <p key={i}>{rf.path} ({formatBytes(rf.freeSpace)} free)</p>
+                ))}
               </div>
             </div>
           ))}
         </div>
-      </div>
-
-      {/* Download Queue */}
-      <div>
-        <h3 className="text-lg font-medium mb-3">
-          Download Queue {status.queue.length > 0 && <span className="text-sm text-[var(--text-secondary)]">({status.queue.length})</span>}
-        </h3>
-        {status.queue.length === 0 ? (
-          <div className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-6 text-center text-sm text-[var(--text-secondary)]">
-            No active downloads
-          </div>
-        ) : (
-          <div className="space-y-2">
-            {status.queue.map((q, i) => {
-              const progress = q.size && q.sizeleft ? Math.round(((q.size - q.sizeleft) / q.size) * 100) : 0;
-              return (
-                <div key={i} className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-3">
-                  <div className="flex justify-between items-center mb-1">
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium truncate">{q.title || "Unknown"}</p>
-                      <p className="text-xs text-[var(--text-secondary)]">
-                        {q.instance} &middot; {q.quality?.quality?.name || "Unknown"} &middot; {q.status}
-                        {q.trackedDownloadState && ` (${q.trackedDownloadState})`}
-                        {q.timeleft && ` &middot; ETA: ${q.timeleft}`}
-                      </p>
-                    </div>
-                    <div className="text-right ml-4 flex-shrink-0">
-                      <p className="text-sm font-medium">{progress}%</p>
-                      {q.size && <p className="text-[10px] text-[var(--text-secondary)]">{formatBytes(q.size)}</p>}
-                    </div>
-                  </div>
-                  {q.size && q.sizeleft !== undefined && (
-                    <div className="w-full h-1.5 bg-gray-700 rounded-full">
-                      <div
-                        className="h-full bg-[var(--accent)] rounded-full transition-all"
-                        style={{ width: `${progress}%` }}
-                      />
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
-      {/* Quality Profiles */}
-      <div>
-        <h3 className="text-lg font-medium mb-3">LowQ Quality Profiles</h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <div className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-4">
-            <p className="text-sm font-medium mb-2">Sonarr-LowQ</p>
-            <div className="flex flex-wrap gap-1">
-              {status.qualityProfiles.sonarr.map((p) => (
-                <span key={p.id} className="px-2 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded">{p.name}</span>
-              ))}
-              {status.qualityProfiles.sonarr.length === 0 && (
-                <span className="text-xs text-[var(--text-secondary)]">No profiles configured</span>
-              )}
-            </div>
-          </div>
-          <div className="bg-[var(--bg-card)] border border-[var(--border)] rounded-lg p-4">
-            <p className="text-sm font-medium mb-2">Radarr-LowQ</p>
-            <div className="flex flex-wrap gap-1">
-              {status.qualityProfiles.radarr.map((p) => (
-                <span key={p.id} className="px-2 py-0.5 text-xs bg-purple-500/20 text-purple-400 rounded">{p.name}</span>
-              ))}
-              {status.qualityProfiles.radarr.length === 0 && (
-                <span className="text-xs text-[var(--text-secondary)]">No profiles configured</span>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
+      </details>
     </div>
   );
 }

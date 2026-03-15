@@ -37,7 +37,6 @@ async function getDiskSpace(cfg: { url: string; apiKey: string }) {
 
 export async function GET() {
   try {
-    // Fetch everything in parallel
     const [
       sonarrLowqStatus,
       radarrLowqStatus,
@@ -124,6 +123,82 @@ export async function GET() {
       },
     };
 
+    // Build detailed content list from lowq instances
+    interface MovieSummary {
+      id: number;
+      title: string;
+      year: number;
+      hasFile: boolean;
+      monitored: boolean;
+      sizeOnDisk: number;
+      qualityName: string | null;
+      status: string; // grabbed, downloading, completed, missing, monitoring
+      poster: string | null;
+    }
+    interface SeriesSummary {
+      id: number;
+      title: string;
+      year: number;
+      monitored: boolean;
+      episodeFileCount: number;
+      episodeCount: number;
+      sizeOnDisk: number;
+      status: string;
+      poster: string | null;
+    }
+
+    const movies: MovieSummary[] = radarrLowqMovies.map((m: Record<string, unknown>) => {
+      const mf = m.movieFile as Record<string, unknown> | undefined;
+      const images = (m.images as Array<{ coverType: string; remoteUrl?: string }>) || [];
+      const posterImg = images.find((i) => i.coverType === "poster");
+      return {
+        id: m.id as number,
+        title: m.title as string,
+        year: m.year as number,
+        hasFile: m.hasFile as boolean,
+        monitored: m.monitored as boolean,
+        sizeOnDisk: (m.sizeOnDisk as number) || 0,
+        qualityName: mf
+          ? ((mf.quality as Record<string, unknown>)?.quality as Record<string, unknown>)?.name as string || null
+          : null,
+        status: (m.hasFile as boolean) ? "completed" : "missing",
+        poster: posterImg?.remoteUrl || null,
+      };
+    });
+
+    const series: SeriesSummary[] = sonarrLowqSeries.map((s: Record<string, unknown>) => {
+      const stats = (s.statistics as Record<string, unknown>) || {};
+      const images = (s.images as Array<{ coverType: string; remoteUrl?: string }>) || [];
+      const posterImg = images.find((i) => i.coverType === "poster");
+      return {
+        id: s.id as number,
+        title: s.title as string,
+        year: s.year as number,
+        monitored: s.monitored as boolean,
+        episodeFileCount: (stats.episodeFileCount as number) || 0,
+        episodeCount: (stats.episodeCount as number) || 0,
+        sizeOnDisk: (stats.sizeOnDisk as number) || 0,
+        status: ((stats.episodeFileCount as number) || 0) === ((stats.episodeCount as number) || 0)
+          ? "completed"
+          : ((stats.episodeFileCount as number) || 0) > 0
+          ? "partial"
+          : "missing",
+        poster: posterImg?.remoteUrl || null,
+      };
+    });
+
+    // Mark items in queue as downloading
+    for (const r of (sonarrQueue.records || [])) {
+      const seriesId = (r as Record<string, unknown>).seriesId as number;
+      const s = series.find((x) => x.id === seriesId);
+      if (s) s.status = "downloading";
+    }
+    for (const r of (radarrQueue.records || [])) {
+      const movieId = (r as Record<string, unknown>).movieId as number;
+      const m = movies.find((x) => x.id === movieId);
+      if (m) m.status = "downloading";
+    }
+
     return NextResponse.json({
       stats,
       instances,
@@ -135,6 +210,7 @@ export async function GET() {
         ...(sonarrQueue.records || []).map((r: Record<string, unknown>) => ({ ...r, instance: "sonarr-lowq" })),
         ...(radarrQueue.records || []).map((r: Record<string, unknown>) => ({ ...r, instance: "radarr-lowq" })),
       ],
+      content: { movies, series },
     });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
