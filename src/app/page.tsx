@@ -166,9 +166,15 @@ export default function Home() {
       };
       setProfiles(p);
       profilesLoaded.current = true;
-      // Auto-select first profile
-      const first = p.radarr[0] || p.sonarr[0];
-      if (first && selectedProfile === 0) setSelectedProfile(first.id);
+      // Auto-select HD-720p profile (best for lowq), fallback to first non-"Any"
+      if (selectedProfile === 0) {
+        const allProfiles = [...p.radarr, ...p.sonarr];
+        const hd720 = allProfiles.find((x) => x.name === "HD-720p");
+        const hd1080 = allProfiles.find((x) => x.name === "HD-1080p");
+        const notAny = allProfiles.find((x) => x.name !== "Any");
+        const pick = hd720 || hd1080 || notAny;
+        if (pick) setSelectedProfile(pick.id);
+      }
     } catch (e) {
       addToast(`Failed to load quality profiles: ${e}`);
     }
